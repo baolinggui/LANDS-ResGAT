@@ -1,0 +1,621 @@
+import os
+import numpy as np
+import rasterio
+from rasterio.warp import reproject, Resampling
+import matplotlib.pyplot as plt
+
+# === 1. file path ===
+base = "/content/drive/MyDrive/"
+raw_path = os.path.join(base, "Raw2.tif")
+dem_path = os.path.join(base, "dem2.tif")
+label_path = os.path.join(base, "shape2.tif")
+
+# === 2. Read the main image as a reference ===
+with rasterio.open(raw_path) as raw_src:
+    raw = raw_src.read()  # (4, H, W)
+    ref_crs = raw_src.crs
+    ref_transform = raw_src.transform
+    ref_width = raw_src.width
+    ref_height = raw_src.height
+    ref_profile = raw_src.profile
+
+# === 3. reprojection function ===
+def reproject_to_match(src_path, ref_crs, ref_transform, ref_width, ref_height, resampling=Resampling.bilinear):
+    with rasterio.open(src_path) as src:
+        src_data = src.read(1)
+        dst_data = np.empty((ref_height, ref_width), dtype=np.float32)
+
+        reproject(
+            source=src_data,
+            destination=dst_data,
+            src_transform=src.transform,
+            src_crs=src.crs,
+            dst_transform=ref_transform,
+            dst_crs=ref_crs,
+            resampling=resampling
+        )
+    return dst_data
+
+# === 4. Re-project DEM and label ===
+dem = reproject_to_match(dem_path, ref_crs, ref_transform, ref_width, ref_height, resampling=Resampling.bilinear)
+label = reproject_to_match(label_path, ref_crs, ref_transform, ref_width, ref_height, resampling=Resampling.nearest).astype(np.uint8)
+
+# === 5. DEM normalization (excluding outliers)===
+def normalize_dem(dem, method="percentile"):
+    dem = np.nan_to_num(dem, nan=0.0, posinf=0.0, neginf=0.0)
+    if method == "percentile":
+        p1 = np.percentile(dem, 1)
+        p99 = np.percentile(dem, 99)
+        dem_clipped = np.clip(dem, p1, p99)
+        normed = (dem_clipped - p1) / (p99 - p1 + 1e-6)
+        return normed
+    elif method == "minmax":
+        return (dem - np.min(dem)) / (np.max(dem) - np.min(dem) + 1e-6)
+    else:
+        raise ValueError("Unsupported normalization method.")
+
+dem_vis = normalize_dem(dem, method="percentile")
+
+# === 6. visualization ===
+plt.figure(figsize=(18, 5))
+
+plt.subplot(1, 3, 1)
+plt.imshow(np.moveaxis(raw[:3], 0, -1))
+plt.title("Raw Image (RGB)")
+plt.axis('off')
+
+plt.subplot(1, 3, 2)
+plt.imshow(dem_vis, cmap='terrain')
+plt.title("Normalized DEM (1–99% Range)")
+plt.axis('off')
+
+plt.subplot(1, 3, 3)
+plt.imshow(label, cmap='gray')
+plt.title("Landslide Label")
+plt.axis('off')
+
+plt.tight_layout()
+plt.show()
+
+
+from skimage.segmentation import felzenszwalb, mark_boundaries
+import matplotlib.pyplot as plt
+import numpy as np
+
+# Assume that raw is already an array of (4, H, W)
+# Convert the first three bands to (H, W, 3) for segmentation
+image_rgb = np.moveaxis(raw[:3], 0, -1).astype(np.uint8)
+
+# Super pixel segmentation parameters (can be adjusted according to data)
+scale    = 25    # Control the thickness of the division: the larger the area, the larger the division.
+sigma    = 0.5    # Pre-smoothing, noise suppression
+min_size = 10     # Minimum number of pixels in the area
+
+# 1. Perform felzenszwalb superpixel segmentation
+segments = felzenszwalb(image_rgb, scale=scale, sigma=sigma, min_size=min_size)
+
+# 2. Visual segmentation boundaries
+plt.figure(figsize=(8, 8))
+plt.imshow(mark_boundaries(image_rgb, segments))
+plt.title(f"felzenszwalb: scale={scale}, sigma={sigma}, min_size={min_size}")
+plt.axis('off')
+plt.show()
+
+import numpy as np
+from skimage.measure import regionprops
+from skimage.feature import graycomatrix, graycoprops
+from scipy.ndimage import gaussian_filter, sobel
+from tqdm import tqdm
+
+def extract_object_features(raw, dem, segments):
+    props = regionprops(segments)
+    num_objs = len(props)
+
+    # Raw image gradient bands
+    raw = raw.astype(np.float32)
+    raw_h, raw_w = raw.shape[1:]
+    raw_rgb = np.moveaxis(raw[:3], 0, -1)
+
+# DEM preprocessing: Calculate slope/slope direction/curvature
+    gy, gx = np.gradient(dem.astype(np.float32))
+    slope = np.hypot(gx, gy)
+    aspect = (np.arctan2(-gy, gx) * 180 / np.pi) % 360
+    dem_smooth = gaussian_filter(dem, sigma=1)
+    curvature = sobel(sobel(dem_smooth, axis=0), axis=0) + sobel(sobel(dem_smooth, axis=1), axis=1)
+
+   # Output feature matrix
+    features = []
+
+    for prop in tqdm(props, desc="Extracting all object features"):
+        minr, minc, maxr, maxc = prop.bbox
+        region_mask = (segments[minr:maxr, minc:maxc] == prop.label)
+
+        # ========== Raw image features ==========
+        region_image = np.moveaxis(raw[:, minr:maxr, minc:maxc], 0, -1)
+        region_image_masked = region_image[region_mask]
+
+        mean_intensity_band1 = np.mean(region_image_masked[:, 0])
+        min_intensity_band4 = np.min(region_image_masked[:, 3])
+        mean_intensity_band4 = np.mean(region_image_masked[:, 3])
+        std_intensity_band3 = np.std(region_image_masked[:, 2])
+
+        area = prop.area
+        aspect_ratio = prop.major_axis_length / prop.minor_axis_length if prop.minor_axis_length > 0 else 0
+
+        # Texture features GLCM (Gray-level Co-occurrence Matrix) – only the first band is used
+        gray_band = region_image[:, :, 0]
+        gray_scaled = (gray_band * 255 / (gray_band.max() + 1e-6)).astype(np.uint8)
+        glcm = graycomatrix(gray_scaled, distances=[1], angles=[0], symmetric=True, normed=True)
+        texture_contrast = graycoprops(glcm, 'contrast')[0, 0]
+        texture_correlation = graycoprops(glcm, 'correlation')[0, 0]
+        texture_homogeneity = graycoprops(glcm, 'homogeneity')[0, 0]
+
+        std_value = np.std(region_image_masked)
+        covariance_matrix = np.cov(region_image_masked, rowvar=False)
+        eigenvalues = np.linalg.eigvals(covariance_matrix)
+        eigenvalues_sorted = sorted(np.abs(eigenvalues), reverse=True)
+        cov_eig_2 = eigenvalues_sorted[1] if len(eigenvalues_sorted) > 1 else 0
+        cov_eig_3 = eigenvalues_sorted[2] if len(eigenvalues_sorted) > 2 else 0
+        cov_eig_5 = eigenvalues_sorted[4] if len(eigenvalues_sorted) > 4 else 0
+
+        # ========== DEM feature ==========
+        coords = prop.coords
+        ys, xs = coords[:, 0], coords[:, 1]
+        elev_vals = dem[ys, xs]
+        slope_vals = slope[ys, xs]
+        aspect_vals = aspect[ys, xs]
+        curve_vals = curvature[ys, xs]
+
+        mean_slope = slope_vals.mean()
+        mean_aspect = aspect_vals.mean()
+        aspect_std = aspect_vals.std()
+        mean_curvature = curve_vals.mean()
+        elev_std = elev_vals.std()
+        slope_range = slope_vals.max() - slope_vals.min()
+
+        # Splicing all features
+        feature_vector = [
+            # Raw
+            texture_contrast, cov_eig_2, aspect_ratio,
+            mean_intensity_band1, area, min_intensity_band4,
+            cov_eig_5, texture_correlation, mean_intensity_band4,
+            std_value, std_intensity_band3, texture_homogeneity, cov_eig_3,
+
+            # DEM
+            mean_slope, mean_aspect, aspect_std,
+            mean_curvature, elev_std, slope_range
+        ]
+
+        features.append(feature_vector)
+
+    features = np.array(features)
+    features = np.nan_to_num(features, nan=0.0)
+
+    feature_names = [
+        # Raw
+        "Texture Contrast", "Covariance Eigenvalue_2", "Aspect Ratio",
+        "Mean Intensity Band1", "Area", "Min Intensity Band4",
+        "Covariance Eigenvalue_5", "Texture Correlation", "Mean Intensity Band4",
+        "Std Value", "Std Intensity Band3", "Texture Homogeneity", "Covariance Eigenvalue_3",
+
+        # DEM
+        "Mean Slope", "Mean Aspect", "Aspect Std",
+        "Mean Curvature", "Elevation Std", "Slope Range"
+    ]
+
+    return features, feature_names
+
+features, feature_names = extract_object_features(raw, dem, segments)
+print("Feature shape:", features.shape)  # (N_objects, 19)
+
+import matplotlib.pyplot as plt
+import numpy as np
+from skimage.measure import regionprops
+
+def project_feature_to_image(segments, feature_vector):
+    """
+    Map object-level features back to pixel images
+    """
+    projected_image = np.zeros_like(segments, dtype=np.float32)
+    props = regionprops(segments)
+
+    for i, prop in enumerate(props):
+        coords = prop.coords
+        projected_image[coords[:, 0], coords[:, 1]] = feature_vector[i]
+
+    return projected_image
+
+# Select feature indexes (you can confirm the indexes based on the feature names)
+# Assume that 0 and 1 are DEM features, and 2 and 3 are raw image features (please replace these with your own)
+selected_indices = [0, 1, 2, 3]
+selected_names = [feature_names[i] for i in selected_indices]
+
+plt.figure(figsize=(14, 8))
+
+for i, idx in enumerate(selected_indices):
+    plt.subplot(2, 2, i + 1)
+    vis_img = project_feature_to_image(segments, features[:, idx])
+    plt.imshow(vis_img, cmap='viridis')
+    plt.title(f"Feature {idx}: {selected_names[i]}")
+    plt.axis('off')
+    plt.colorbar()
+
+plt.tight_layout()
+plt.show()
+
+from scipy.spatial import KDTree
+from scipy.sparse import lil_matrix
+from skimage.measure import regionprops
+from tqdm import tqdm
+
+def find_neighbors(props, radius=10):
+    centroids = [prop.centroid for prop in props]
+    tree = KDTree(centroids)
+    neighbors = tree.query_ball_tree(tree, radius)
+    return neighbors
+
+def build_adjacency_graph(segments, radius=10):
+    props = regionprops(segments)
+    num_nodes = len(props)
+    neighbors = find_neighbors(props, radius)
+    adjacency_matrix = lil_matrix((num_nodes, num_nodes), dtype=np.float32)
+
+    for i, nbrs in tqdm(enumerate(neighbors), total=num_nodes, desc="Building adjacency matrix"):
+        for j in nbrs:
+            if i != j:
+                adjacency_matrix[i, j] = 1
+                adjacency_matrix[j, i] = 1  # undirected
+    return adjacency_matrix
+
+import numpy as np
+
+def extract_object_labels(label_image, segments):
+    props = regionprops(segments)
+    labels = []
+    for prop in tqdm(props, desc="Extracting object labels"):
+        coords = prop.coords
+        region_labels = label_image[coords[:, 0], coords[:, 1]]
+        dominant_label = np.bincount(region_labels).argmax()
+        labels.append(dominant_label)
+    return np.array(labels)
+
+# Assume you already have the following variables:
+# segments: segmentation results (H, W)
+# label: label image (H, W)
+
+adj_matrix = build_adjacency_graph(segments, radius=10)
+labels = extract_object_labels(label, segments)
+
+print("Adjacency matrix shape:", adj_matrix.shape)
+print("Label vector shape:", labels.shape)  # [N_objects]
+print("Label classes:", np.unique(labels))
+
+
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.feature_selection import VarianceThreshold, SelectFromModel
+from sklearn.preprocessing import StandardScaler
+
+# Step 1: Standardization
+scaler = StandardScaler()
+features_scaled = scaler.fit_transform(features)
+
+# Step 2: Variance filtering
+selector_var = VarianceThreshold(threshold=0.01)
+features_var = selector_var.fit_transform(features_scaled)
+selected_idx_var = selector_var.get_support(indices=True)
+
+print("Step 2️⃣: Number of features retained after removing low-variance features:", features_var.shape[1])
+
+# Step 3:Using random forests to evaluate feature importance
+rf = RandomForestClassifier(n_estimators=100, random_state=42)
+rf.fit(features_var, labels)
+
+selector_rf = SelectFromModel(rf, prefit=True, threshold="mean")  # 也可以设为中位数或 0.01
+features_selected = selector_rf.transform(features_var)
+selected_idx_rf = selector_rf.get_support(indices=True)
+
+print("Step 3️⃣: Number of features retained after random forest:", features_selected.shape[1])
+
+# Merge indexes
+final_selected_indices = selected_idx_var[selected_idx_rf]
+print("Final retained feature index:", final_selected_indices)
+final_selected_names = [feature_names[i] for i in final_selected_indices]
+print("Final retained feature name:", final_selected_names)
+
+from scipy.spatial import KDTree
+from scipy.sparse import lil_matrix
+from skimage.measure import regionprops
+import numpy as np
+from tqdm import tqdm
+import torch
+from torch_geometric.data import Data
+from torch_geometric.utils import from_scipy_sparse_matrix
+
+# 1. Calculate the adjacency matrix (based on object centroids)
+def find_neighbors(props, radius=30):
+    centroids = [prop.centroid for prop in props]
+    tree = KDTree(centroids)
+    neighbors = tree.query_ball_tree(tree, radius)
+    return neighbors
+
+def build_adjacency_matrix(segments, radius=30):
+    props = regionprops(segments)
+    neighbors = find_neighbors(props, radius)
+    adjacency_matrix = lil_matrix((len(props), len(props)), dtype=np.float32)
+
+    for i, nbrs in tqdm(enumerate(neighbors), total=len(neighbors), desc="Building graph"):
+        for j in nbrs:
+            if i != j:
+                adjacency_matrix[i, j] = 1
+                adjacency_matrix[j, i] = 1
+    return adjacency_matrix, props
+
+# 2. Extract labels (labels of most pixels within an object)
+def extract_object_labels(label_mask, segments):
+    props = regionprops(segments)
+    labels = []
+    for prop in tqdm(props, desc="Extracting labels"):
+        coords = prop.coords
+        values = label_mask[coords[:, 0], coords[:, 1]]
+        majority = np.bincount(values).argmax()
+        labels.append(majority)
+    return np.array(labels)
+
+
+# 3. Constructing PyG Data Objects
+from torch_geometric.data import Data
+from torch_geometric.utils import from_scipy_sparse_matrix
+from skimage.measure import regionprops
+from scipy.spatial import KDTree
+from scipy.sparse import lil_matrix
+from tqdm import tqdm
+import numpy as np
+import torch
+
+def build_pyg_graph_with_edge_attr(features, segments, label_mask, dem, aspect_map, raw, radius=30):
+    props = regionprops(segments)
+    positions = np.array([prop.centroid for prop in props])
+    num_nodes = len(props)
+
+    # Constructing an adjacency matrix
+    tree = KDTree(positions)
+    neighbors = tree.query_ball_tree(tree, radius)
+    adj = lil_matrix((num_nodes, num_nodes), dtype=np.float32)
+
+    edge_index_list = []
+    edge_attr_list = []
+
+    for i, nbrs in tqdm(enumerate(neighbors), total=num_nodes, desc="Building graph with edge features"):
+        for j in nbrs:
+            if i != j:
+                # edge index
+                edge_index_list.append([i, j])
+
+                # The distance between the centers of mass of nodes i and j
+                dist = np.linalg.norm(positions[i] - positions[j])
+
+                # slope difference
+                coords_i = props[i].coords
+                coords_j = props[j].coords
+                asp_i = aspect_map[coords_i[:, 0], coords_i[:, 1]].mean()
+                asp_j = aspect_map[coords_j[:, 0], coords_j[:, 1]].mean()
+                aspect_diff = np.abs(asp_i - asp_j)
+                aspect_diff = min(aspect_diff, 360 - aspect_diff) / 180.0  # 归一化
+
+                # Image mean difference (using Band 1)
+                band1 = raw[0]  # (H, W)
+                mean_i = band1[coords_i[:, 0], coords_i[:, 1]].mean()
+                mean_j = band1[coords_j[:, 0], coords_j[:, 1]].mean()
+                band_diff = np.abs(mean_i - mean_j) / 255.0  # 归一化
+
+                # Splicing edge features: Euclidean distance, slope difference, grayscale difference
+                edge_attr = [dist / radius, aspect_diff, band_diff]
+                edge_attr_list.append(edge_attr)
+
+                # symmetrical side
+                edge_index_list.append([j, i])
+                edge_attr_list.append(edge_attr)
+
+                adj[i, j] = 1
+                adj[j, i] = 1
+
+    edge_index = torch.tensor(edge_index_list, dtype=torch.long).t().contiguous()
+    edge_attr = torch.tensor(edge_attr_list, dtype=torch.float)
+
+    # Extract labels
+    labels = extract_object_labels(label_mask, segments)
+
+    data = Data(
+        x=torch.tensor(features, dtype=torch.float),
+        edge_index=edge_index,
+        edge_attr=edge_attr,
+        y=torch.tensor(labels, dtype=torch.long),
+        pos=torch.tensor(positions, dtype=torch.float)
+    )
+    return data
+
+gy, gx = np.gradient(dem.astype(np.float32))
+aspect = (np.arctan2(-gy, gx) * 180 / np.pi) % 360  # 0–360°
+
+
+# Building PyTorch Geometric Graph Data
+graph_data = build_pyg_graph_with_edge_attr(
+    features_selected,
+    segments,
+    label_mask=label,
+    dem=dem,                     
+    aspect_map=aspect,            
+    raw=raw,                     
+    radius=10
+)
+
+
+print(graph_data)
+
+from sklearn.model_selection import train_test_split
+import torch
+
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+# Graph data partitioning
+num_nodes = graph_data.num_nodes
+indices = list(range(num_nodes))
+
+# stratified split
+train_idx, val_idx = train_test_split(indices, test_size=0.2, stratify=graph_data.y.cpu(), random_state=42)
+
+
+train_mask = torch.zeros(num_nodes, dtype=torch.bool)
+val_mask = torch.zeros(num_nodes, dtype=torch.bool)
+train_mask[train_idx] = True
+val_mask[val_idx] = True
+
+
+graph_data.train_mask = train_mask
+graph_data.val_mask = val_mask
+graph_data = graph_data.to(device)
+
+
+y_np = graph_data.y.cpu().numpy()
+_, counts = np.unique(y_np, return_counts=True)
+class_weights = torch.tensor([1.0 / c for c in counts], dtype=torch.float)
+class_weights = class_weights / class_weights.sum()
+class_weights = class_weights.to(device)
+
+criterion = torch.nn.NLLLoss(weight=class_weights)
+
+import torch
+import torch.nn.functional as F
+from torch.nn import Linear, BatchNorm1d, ReLU
+from torch_geometric.nn import SAGEConv, GATv2Conv
+
+
+class HybridResNetBlock(torch.nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(HybridResNetBlock, self).__init__()
+        self.sage_conv = SAGEConv(in_channels, out_channels)
+        self.gat_conv = GATv2Conv(out_channels, out_channels // 4, heads=4, concat=True, edge_dim=3)
+
+        self.bn1 = BatchNorm1d(out_channels)
+        self.bn2 = BatchNorm1d(out_channels)
+        self.relu = ReLU(inplace=False)
+
+        self.shortcut = Linear(in_channels, out_channels) if in_channels != out_channels else None
+
+    def forward(self, x, edge_index, edge_attr):
+        identity = x
+        out = self.sage_conv(x, edge_index)
+        out = self.bn1(out)
+        out = self.relu(out)
+        out = self.gat_conv(out, edge_index, edge_attr=edge_attr)
+        out = self.bn2(out)
+        out = self.relu(out)
+
+        if self.shortcut:
+            identity = self.shortcut(identity)
+        out = out + identity
+        out = self.relu(out)
+        return out
+
+class HybridResNet18GNN(torch.nn.Module):
+    def __init__(self, in_channels, num_classes, hidden_channels=64):
+        super(HybridResNet18GNN, self).__init__()
+        self.initial_conv = SAGEConv(in_channels, hidden_channels)
+        self.initial_bn = BatchNorm1d(hidden_channels)
+        self.initial_relu = ReLU(inplace=False)
+
+        self.block1 = HybridResNetBlock(hidden_channels, hidden_channels)
+        self.block2 = HybridResNetBlock(hidden_channels, hidden_channels)
+        self.block3 = HybridResNetBlock(hidden_channels, hidden_channels * 2)
+        self.block4 = HybridResNetBlock(hidden_channels * 2, hidden_channels * 2)
+        self.block5 = HybridResNetBlock(hidden_channels * 2, hidden_channels * 4)
+        self.block6 = HybridResNetBlock(hidden_channels * 4, hidden_channels * 4)
+        self.block7 = HybridResNetBlock(hidden_channels * 4, hidden_channels * 8)
+        self.block8 = HybridResNetBlock(hidden_channels * 8, hidden_channels * 8)
+
+        self.fc = Linear(hidden_channels * 8, num_classes)
+
+    def forward(self, x, edge_index, edge_attr):
+        x = self.initial_conv(x, edge_index)
+        x = self.initial_bn(x)
+        x = self.initial_relu(x)
+
+        x = self.block1(x, edge_index, edge_attr)
+        x = self.block2(x, edge_index, edge_attr)
+        x = self.block3(x, edge_index, edge_attr)
+        x = self.block4(x, edge_index, edge_attr)
+        x = self.block5(x, edge_index, edge_attr)
+        x = self.block6(x, edge_index, edge_attr)
+        x = self.block7(x, edge_index, edge_attr)
+        x = self.block8(x, edge_index, edge_attr)
+
+        x = self.fc(x)
+        return F.log_softmax(x, dim=1)
+
+def train(model, data, optimizer, criterion, epochs=200):
+    model = model.to(device)
+    data = data.to(device)
+
+    for epoch in range(epochs):
+        model.train()
+        optimizer.zero_grad()
+        out = model(data.x, data.edge_index, data.edge_attr)
+        loss = criterion(out[data.train_mask], data.y[data.train_mask])
+        loss.backward()
+        optimizer.step()
+
+        # Eval
+        model.eval()
+        with torch.no_grad():
+            pred = out.argmax(dim=1)
+            train_acc = (pred[data.train_mask] == data.y[data.train_mask]).float().mean().item()
+            val_acc = (pred[data.val_mask] == data.y[data.val_mask]).float().mean().item()
+
+        print(f"Epoch {epoch:03d} | Loss: {loss:.4f} | Train Acc: {train_acc:.4f} | Val Acc: {val_acc:.4f}")
+
+    return model
+
+model = HybridResNet18GNN(
+    in_channels=graph_data.x.shape[1],
+    num_classes=2,
+    hidden_channels=32
+).to(device)
+
+optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-4)
+
+model = train(model, graph_data, optimizer, criterion, epochs=100)
+
+import matplotlib.pyplot as plt
+import numpy as np
+from skimage.measure import regionprops
+
+
+model.eval()
+with torch.no_grad():
+    out = model(graph_data.x, graph_data.edge_index, graph_data.edge_attr)
+    pred_labels = out.argmax(dim=1).cpu().numpy()  # shape: (N_objects,)
+
+
+def visualize_label_map(segments, label_array, title="Label Map", cmap='gray'):
+    label_map = np.zeros_like(segments, dtype=np.uint8)
+    props = regionprops(segments)
+    assert len(label_array) == len(props)
+
+    for i, prop in enumerate(props):
+        coords = prop.coords
+        label_map[coords[:, 0], coords[:, 1]] = label_array[i]
+
+    plt.figure(figsize=(10, 10))
+    plt.imshow(label_map, cmap=cmap)
+    plt.title(title)
+    plt.axis('off')
+    plt.show()
+
+    return label_map
+
+
+true_labels = graph_data.y.cpu().numpy()
+true_map = visualize_label_map(segments, true_labels, title="Ground Truth (Landslide)", cmap="gray")
+
+pred_map = visualize_label_map(segments, pred_labels, title="Predicted Labels", cmap="gray")
