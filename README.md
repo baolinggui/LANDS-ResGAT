@@ -23,7 +23,7 @@ Compared with conventional pixel-based landslide mapping approaches, LANDS-ResGA
 
 ## Repository structure
 ## Recommended citation format
-## Gui, B., Bhardwaj, A., Sam, L., et al. Year. Scalable landslide detection in complex Himalayan topography via a novel object-based residual graph attention network. Journal Name, Volume(Issue), Pages. DOI
+## Gui, B., Bhardwaj, A., Sam, L., Sam, B.C., Ahmed, R., Ali, S.N., Pandey, P., Vatsal, S., Martin-Torres, J., 2026. Scalable landslide detection in complex Himalayan topography via a novel object-based residual graph attention network. Geoscience Frontiers.
 
 ```text
 LANDS-ResGAT/
