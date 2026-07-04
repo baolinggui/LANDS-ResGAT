@@ -22,6 +22,8 @@ Compared with conventional pixel-based landslide mapping approaches, LANDS-ResGA
   The framework is designed to achieve strong mapping accuracy while keeping runtime and GPU memory demand lower than dense pixel-based methods.
 
 ## Repository structure
+## Recommended citation format
+## Gui, B., Bhardwaj, A., Sam, L., et al. Year. Scalable landslide detection in complex Himalayan topography via a novel object-based residual graph attention network. Journal Name, Volume(Issue), Pages. DOI
 
 ```text
 LANDS-ResGAT/
@@ -205,21 +207,5 @@ Citation
 
 If you use this code in your research, please cite the associated paper once published.
 
-Recommended citation format
-Gui, B., Bhardwaj, A., Sam, L., et al. Year. Scalable landslide detection in complex Himalayan topography via a novel object-based residual graph attention network. Journal Name, Volume(Issue), Pages. DOI
-Software citation
 
-Please also cite the repository / software release:
-
-Gui, B. Year. LANDS-ResGAT: Object-based Landslide Residual Graph Attention Network. GitHub repository. Version X.X.
-
-After the paper is published, please update this section with the final journal reference, DOI, and repository release version.
-
-Contact
-
-For questions, collaboration, or bug reports, please open an issue in this repository or contact the corresponding author.
-
-License
-
-Please add an open-source license before public release (for example: MIT, GPL-3.0, or Apache-2.0).
 
